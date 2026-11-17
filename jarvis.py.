@@ -1,0 +1,650 @@
+
+"""
+JARVIS BLACK BOX v1.1
+10 specialized agents + DOCTOR + CORE + BLACK BOX
+
+PUBLIC MARKET DATA ONLY.
+NO LIVE TRADING.
+NO API KEYS REQUIRED.
+"""
+
+import ccxt
+import time
+import json
+from datetime import datetime, timezone
+
+# ==================================================
+# 1. SETTINGS
+# ==================================================
+
+EXCHANGE_NAMES = [
+    "okx",
+    "kraken",
+    "coinbase",
+    "bitstamp",f
+    "binance"
+]
+
+SYMBOL = "BTC/USDT"
+
+TRADE_AMOUNT = 100.0
+ASSUMED_FEE = 0.001
+MIN_PROFIT = 0.05
+
+SCAN_INTERVAL = 30
+MAX_DATA_AGE = 90
+ORDER_BOOK_LIMIT = 20
+
+LOG_FILE = "jarvis_black_box_log.jsonl"
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ==================================================
+# 2. AGENT: SCANNER
+# ==================================================
+
+class ScannerAgent:
+
+    def scan(self, exchanges):
+        results = {}
+
+        for name, exchange in exchanges.items():
+            try:
+                if SYMBOL not in exchange.markets:
+                    print(f"⚠️ {name}: {SYMBOL} unavailable")
+                    continue
+
+                book = exchange.fetch_order_book(
+                    SYMBOL,
+                    limit=ORDER_BOOK_LIMIT
+                )
+
+                results[name] = {
+                    "bids": book.get("bids") or [],
+                    "asks": book.get("asks") or [],
+                    "exchange_timestamp": book.get("timestamp"),
+                    "received_at": time.time()
+                }
+
+                print(f"✅ {name}: market data received")
+
+            except Exception as error:
+                print(f"❌ {name}: {str(error)[:120]}")
+
+        return results
+
+
+# ==================================================
+# 3. AGENT: VALIDATOR
+# ==================================================
+
+class ValidatorAgent:
+
+    def check(self, markets):
+        valid = {}
+
+        for name, book in markets.items():
+            bids = book["bids"]
+            asks = book["asks"]
+
+            if not bids or not asks:
+                continue
+
+            try:
+                bid = float(bids[0][0])
+                ask = float(asks[0][0])
+
+                if bid <= 0 or ask <= 0:
+                    continue
+
+                if bid >= ask:
+                    print(f"⚠️ {name}: invalid spread")
+                    continue
+
+                if any(
+                    float(level[0]) <= 0 or float(level[1]) <= 0
+                    for level in bids + asks
+                ):
+                    continue
+
+                valid[name] = book
+
+            except (ValueError, TypeError, IndexError):
+                continue
+
+        return valid
+
+
+# ==================================================
+# 4. AGENT: FRESHNESS
+# ==================================================
+
+class FreshnessAgent:
+
+    def check(self, markets):
+        fresh = {}
+
+        for name, book in markets.items():
+            age = time.time() - book["received_at"]
+
+            if age < 0 or age > MAX_DATA_AGE:
+                print(f"⚠️ {name}: old local data")
+                continue
+
+            # Exchange timestamp is optional.
+            # Local receipt time is used for freshness.
+
+            fresh[name] = book
+
+        return fresh
+
+
+# ==================================================
+# 5. AGENT: CURRENCY
+# ==================================================
+
+class CurrencyAgent:
+
+    def check(self, symbol):
+        parts = symbol.split("/")
+
+        if len(parts) != 2:
+            return False
+
+        base, quote = parts
+
+        if base != "BTC":
+            return False
+
+        if quote != "USDT":
+            print("Currency conversion required")
+            return False
+
+        return True
+
+
+# ==================================================
+# 6. AGENT: FEES
+# ==================================================
+
+class FeesAgent:
+
+    def calculate(self, buy_cost, sell_revenue):
+        buy_fee = buy_cost * ASSUMED_FEE
+        sell_fee = sell_revenue * ASSUMED_FEE
+
+        net = (
+            sell_revenue
+            - sell_fee
+            - buy_cost
+            - buy_fee
+        )
+
+        return {
+            "buy_fee": buy_fee,
+            "sell_fee": sell_fee,
+            "net_profit": net
+        }
+
+
+# ==================================================
+# 7. AGENT: ORDER BOOK
+# ==================================================
+
+class OrderBookAgent:
+
+    def simulate_buy(self, asks, quote_amount):
+        remaining = quote_amount
+        btc_amount = 0.0
+        spent = 0.0
+
+        for level in asks:
+            price = float(level[0])
+            quantity = float(level[1])
+
+            available = price * quantity
+            take = min(remaining, available)
+
+            if take <= 0:
+                continue
+
+            btc_amount += take / price
+            spent += take
+            remaining -= take
+
+            if remaining <= 0.00000001:
+                break
+
+        if remaining > 0.00000001 or btc_amount <= 0:
+            return None
+
+        return {
+            "btc": btc_amount,
+            "spent": spent,
+            "average_price": spent / btc_amount
+        }
+
+    def simulate_sell(self, bids, btc_amount):
+        remaining = btc_amount
+        revenue = 0.0
+
+        for level in bids:
+            price = float(level[0])
+            quantity = float(level[1])
+
+            take = min(remaining, quantity)
+
+            if take <= 0:
+                continue
+
+            revenue += take * price
+            remaining -= take
+
+            if remaining <= 0.0000000001:
+                break
+
+        if remaining > 0.0000000001:
+            return None
+
+        return revenue
+
+
+# ==================================================
+# 8. AGENT: SLIPPAGE
+# ==================================================
+
+class SlippageAgent:
+
+    def calculate(self, buy_book, sell_book, buy, revenue):
+        best_ask = float(buy_book["asks"][0][0])
+        best_bid = float(sell_book["bids"][0][0])
+
+        average_buy = buy["average_price"]
+        average_sell = revenue / buy["btc"]
+
+        buy_slippage = max(
+            0.0,
+            (average_buy / best_ask - 1) * 100
+        )
+
+        sell_slippage = max(
+            0.0,
+            (1 - average_sell / best_bid) * 100
+        )
+
+        return {
+            "buy_pct": buy_slippage,
+            "sell_pct": sell_slippage
+        }
+
+
+# ==================================================
+# 9. AGENT: LIQUIDITY
+# ==================================================
+
+class LiquidityAgent:
+
+    def check(self, buy, revenue):
+        return (
+            buy is not None
+            and revenue is not None
+            and buy["btc"] > 0
+            and revenue > 0
+        )
+
+
+# ==================================================
+# 10. AGENT: RISK
+# ==================================================
+
+class RiskAgent:
+
+    def check(self, profit, slippage):
+        risks = []
+
+        if profit <= 0:
+            risks.append("Negative net result")
+
+        if profit < MIN_PROFIT:
+            risks.append("Profit below minimum threshold")
+
+        if slippage["buy_pct"] > 0.5:
+            risks.append("High buy slippage")
+
+        if slippage["sell_pct"] > 0.5:
+            risks.append("High sell slippage")
+
+        return {
+            "approved": len(risks) == 0,
+            "risks": risks
+        }
+
+
+# ==================================================
+# 11. AGENT: SKEPTIC
+# ==================================================
+
+class SkepticAgent:
+
+    def challenge(self, profit, risk):
+        objections = []
+
+        if profit <= MIN_PROFIT:
+            objections.append("Insufficient profit")
+
+        if not risk["approved"]:
+            objections.extend(risk["risks"])
+
+        return {
+            "accepted": len(objections) == 0,
+            "objections": list(dict.fromkeys(objections))
+        }
+
+
+# ==================================================
+# 12. JARVIS DOCTOR
+# ==================================================
+
+class JarvisDoctor:
+
+    def check(self, agents, markets):
+        required = {
+            "scanner": "scan",
+            "validator": "check",
+            "freshness": "check",
+            "currency": "check",
+            "fees": "calculate",
+            "order_book": "simulate_buy",
+            "slippage": "calculate",
+            "liquidity": "check",
+            "risk": "check",
+            "skeptic": "challenge"
+        }
+
+        errors = []
+
+        for name, method in required.items():
+            agent = agents.get(name)
+
+            if agent is None:
+                errors.append(f"{name}: missing")
+            elif not callable(getattr(agent, method, None)):
+                errors.append(f"{name}: method missing")
+
+        if len(markets) < 2:
+            errors.append("Less than two usable exchanges")
+
+        return {
+            "healthy": len(errors) == 0,
+            "errors": errors
+        }
+
+
+# ==================================================
+# 13. BLACK BOX JOURNAL
+# ==================================================
+
+class BlackBox:
+
+    def record(self, result):
+        try:
+            with open(
+                LOG_FILE,
+                "a",
+                encoding="utf-8"
+            ) as file:
+                file.write(
+                    json.dumps(
+                        result,
+                        ensure_ascii=False
+                    ) + "\n"
+                )
+
+        except Exception as error:
+            print("BLACK BOX ERROR:", error)
+
+
+# ==================================================
+# 14. JARVIS CORE
+# ==================================================
+
+class JarvisCore:
+
+    def __init__(self):
+        self.agents = {
+            "scanner": ScannerAgent(),
+            "validator": ValidatorAgent(),
+            "freshness": FreshnessAgent(),
+            "currency": CurrencyAgent(),
+            "fees": FeesAgent(),
+            "order_book": OrderBookAgent(),
+            "slippage": SlippageAgent(),
+            "liquidity": LiquidityAgent(),
+            "risk": RiskAgent(),
+            "skeptic": SkepticAgent()
+        }
+
+        self.doctor = JarvisDoctor()
+        self.black_box = BlackBox()
+        self.exchanges = {}
+
+    def connect(self):
+        print("\nJARVIS: connecting exchanges\n")
+
+        for name in EXCHANGE_NAMES:
+            try:
+                exchange_class = getattr(ccxt, name)
+
+                exchange = exchange_class({
+                    "enableRateLimit": True,
+                    "timeout": 15000
+                })
+
+                exchange.load_markets()
+
+                self.exchanges[name] = exchange
+
+                print(f"✅ {name.upper()} connected")
+
+            except Exception as error:
+                print(f"❌ {name.upper()}: {str(error)[:120]}")
+
+    def run_cycle(self):
+        print("\n" + "=" * 45)
+        print("JARVIS BLACK BOX — MARKET SCAN")
+        print(utc_now())
+        print("=" * 45)
+
+        raw = self.agents["scanner"].scan(
+            self.exchanges
+        )
+
+        valid = self.agents["validator"].check(raw)
+
+        fresh = self.agents["freshness"].check(valid)
+
+        if not self.agents["currency"].check(SYMBOL):
+            print("Currency validation failed")
+            return
+
+        health = self.doctor.check(
+            self.agents,
+            fresh
+        )
+
+        if not health["healthy"]:
+            print("DOCTOR: SYSTEM WARNING")
+
+            for error in health["errors"]:
+                print(" -", error)
+
+            return
+
+        print("DOCTOR: SYSTEM HEALTHY")
+        print("CORE: all 10 agents available")
+
+        signals = []
+
+        names = list(fresh.keys())
+
+        for buy_name in names:
+            for sell_name in names:
+
+                if buy_name == sell_name:
+                    continue
+
+                buy_book = fresh[buy_name]
+                sell_book = fresh[sell_name]
+
+                buy = self.agents["order_book"].simulate_buy(
+                    buy_book["asks"],
+                    TRADE_AMOUNT
+                )
+
+                if buy is None:
+                    continue
+
+                revenue = self.agents["order_book"].simulate_sell(
+                    sell_book["bids"],
+                    buy["btc"]
+                )
+
+                if revenue is None:
+                    continue
+
+                if not self.agents["liquidity"].check(
+                    buy,
+                    revenue
+                ):
+                    continue
+
+                fees = self.agents["fees"].calculate(
+                    buy["spent"],
+                    revenue
+                )
+
+                profit = fees["net_profit"]
+
+                slippage = self.agents["slippage"].calculate(
+                    buy_book,
+                    sell_book,
+                    buy,
+                    revenue
+                )
+
+                risk = self.agents["risk"].check(
+                    profit,
+                    slippage
+                )
+
+                skeptic = self.agents["skeptic"].challenge(
+                    profit,
+                    risk
+                )
+
+                result = {
+                    "time": utc_now(),
+                    "symbol": SYMBOL,
+                    "buy_exchange": buy_name,
+                    "sell_exchange": sell_name,
+                    "amount_usdt": TRADE_AMOUNT,
+                    "estimated_profit_usdt": round(profit, 6),
+                    "buy_fee_usdt": round(fees["buy_fee"], 6),
+                    "sell_fee_usdt": round(fees["sell_fee"], 6),
+                    "buy_slippage_pct": round(
+                        slippage["buy_pct"], 4
+                    ),
+                    "sell_slippage_pct": round(
+                        slippage["sell_pct"], 4
+                    ),
+                    "risk_approved": risk["approved"],
+                    "skeptic_accepted": skeptic["accepted"],
+                    "objections": skeptic["objections"]
+                }
+
+                signals.append(result)
+                self.black_box.record(result)
+
+        signals.sort(
+            key=lambda item: item["estimated_profit_usdt"],
+            reverse=True
+        )
+
+        if not signals:
+            print("No complete order-book comparisons")
+            return
+
+        print("\nTOP OPPORTUNITIES")
+
+        for item in signals[:5]:
+            print("\n", item["buy_exchange"], "->",
+                  item["sell_exchange"])
+
+            print(
+                "Estimated net:",
+                item["estimated_profit_usdt"],
+                "USDT"
+            )
+
+            print(
+                "SKEPTIC:",
+                "ACCEPTED" if item["skeptic_accepted"]
+                else "REJECTED"
+            )
+
+            if item["objections"]:
+                print("Reasons:", item["objections"])
+
+        print("\nBLACK BOX: journal updated")
+        print("No orders placed.")
+
+    def close(self):
+        for name, exchange in self.exchanges.items():
+            try:
+                exchange.close()
+            except Exception:
+                pass
+
+
+# ==================================================
+# 15. START JARVIS
+# ==================================================
+
+def main():
+
+    print("=" * 45)
+    print("JARVIS BLACK BOX v1.1")
+    print("10 AGENTS | DOCTOR | CORE | BLACK BOX")
+    print("MONITORING ONLY — NO LIVE TRADING")
+    print("=" * 45)
+
+    jarvis = JarvisCore()
+
+    try:
+        jarvis.connect()
+
+        if len(jarvis.exchanges) < 2:
+            print("Not enough exchanges. Safe shutdown.")
+            return
+
+        while True:
+            jarvis.run_cycle()
+
+            print(
+                f"\nNext scan in {SCAN_INTERVAL} seconds"
+            )
+
+            time.sleep(SCAN_INTERVAL)
+
+    except KeyboardInterrupt:
+        print("\nJARVIS stopped by user.")
+
+    finally:
+        jarvis.close()
+
+
+if __name__ == "__main__":
+    main()
